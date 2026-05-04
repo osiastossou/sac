@@ -125,10 +125,13 @@ def train_one_epoch(model, loader, optimizer, criterion, device, img_size):
     import time
     model.train()
     total_loss = 0.0
+    running_loss = 0.0
 
     try:
         from tqdm import tqdm
-        pbar = tqdm(loader, desc='  train', ncols=90, leave=False)
+        pbar = tqdm(loader, desc='  [TRAIN]', ncols=100,
+                    leave=True,          # ← reste affiché après 100%
+                    dynamic_ncols=False)
         iterable = pbar
     except ImportError:
         iterable = loader
@@ -148,17 +151,27 @@ def train_one_epoch(model, loader, optimizer, criterion, device, img_size):
         optimizer.step()
 
         elapsed = time.time() - t0
-        total_loss += loss.item()
+        total_loss   += loss.item()
+        running_loss  = total_loss / (i + 1)
 
         if pbar is not None:
-            pbar.set_postfix(loss=f'{loss.item():.4f}', t=f'{elapsed:.1f}s')
+            pbar.set_postfix(
+                loss=f'{loss.item():.4f}',
+                avg=f'{running_loss:.4f}',
+                t=f'{elapsed:.1f}s',
+                refresh=True
+            )
         else:
             print(f'    batch {i+1}/{len(loader)} | '
-                  f'loss={loss.item():.4f} | {elapsed:.1f}s/batch',
-                  flush=True)
+                  f'loss={loss.item():.4f} | avg={running_loss:.4f} | '
+                  f'{elapsed:.1f}s/batch', flush=True)
 
+    # Ligne de résumé visible après la barre
     if pbar is not None:
+        pbar.set_description('  [TRAIN] done')
         pbar.close()
+
+    print(f'  → Train loss moyen : {running_loss:.4f}', flush=True)
     return total_loss / len(loader)
 
 
@@ -170,26 +183,34 @@ def validate(model, loader, metric, device, img_size):
     model.eval()
     metric.reset()
 
-    for batch in loader:
+    try:
+        from tqdm import tqdm
+        pbar = tqdm(loader, desc='  [ VAL ]', ncols=100,
+                    leave=True, dynamic_ncols=False)
+        iterable = pbar
+    except ImportError:
+        iterable = loader
+        pbar = None
+
+    print('  → Validation en cours...', flush=True)
+
+    for i, batch in enumerate(iterable):
         imgs  = batch['image'].to(device)
-        boxes = batch['boxes']    # CPU
-        mask  = batch['mask']     # CPU
+        boxes = batch['boxes']
+        mask  = batch['mask']
 
         cls_preds, reg_preds = model(imgs)
 
-        # Décode les prédictions
         preds = decode_predictions(cls_preds, reg_preds,
                                    img_size=img_size, conf_thresh=0.01,
                                    num_classes=NUM_CLASSES)
 
-        # Prépare les GT pour la métrique (format x1y1x2y2 + cls)
         gts = []
         for b in range(len(preds)):
-            valid = boxes[b][mask[b]]          # (N,5) xywh_norm+cls
+            valid = boxes[b][mask[b]]
             if len(valid) == 0:
                 gts.append(torch.zeros(0, 5))
                 continue
-            # xywh → xyxy
             gt_xyxy = torch.zeros_like(valid)
             gt_xyxy[:, 0] = valid[:, 0] - valid[:, 2] / 2
             gt_xyxy[:, 1] = valid[:, 1] - valid[:, 3] / 2
@@ -200,7 +221,18 @@ def validate(model, loader, metric, device, img_size):
 
         metric.update(preds, gts)
 
-    return metric.compute()
+        if pbar is not None and i % max(1, len(loader) // 10) == 0:
+            pbar.set_postfix(batches=f'{i+1}/{len(loader)}', refresh=True)
+
+    if pbar is not None:
+        pbar.set_description('  [ VAL ] done')
+        pbar.close()
+
+    print('  → Calcul du mAP...', flush=True)
+    results = metric.compute()
+    print(f'  → mAP@50={results["mAP50"]:.4f} | '
+          f'mAP@50:95={results["mAP50_95"]:.4f}', flush=True)
+    return results
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -272,9 +304,18 @@ def main():
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
 
+        # Séparateur d'epoch visible
+        sep = '─' * 65
+        print(f'\n{sep}', flush=True)
+        print(f'  Epoch {epoch}/{args.epochs}  |  conv={args.conv.upper()}  '
+              f'|  lr={optimizer.param_groups[0]["lr"]:.2e}', flush=True)
+        print(sep, flush=True)
+
         train_loss = train_one_epoch(
             model, train_dl, optimizer, criterion, device, args.img_size
         )
+
+        print(f'\n  Validation...', flush=True)
         val_results = validate(
             model, val_dl, metric, device, args.img_size
         )
@@ -284,6 +325,15 @@ def main():
         lr_now  = scheduler.get_last_lr()[0]
         map50   = val_results['mAP50']
         map5095 = val_results['mAP50_95']
+
+        # Résumé de l'epoch
+        print(f'\n  ┌─ EPOCH {epoch:3d}/{args.epochs} RÉSUMÉ {"─"*38}', flush=True)
+        print(f'  │  loss        = {train_loss:.4f}', flush=True)
+        print(f'  │  mAP@50      = {map50:.4f}', flush=True)
+        print(f'  │  mAP@50:95   = {map5095:.4f}', flush=True)
+        print(f'  │  lr          = {lr_now:.2e}', flush=True)
+        print(f'  │  temps total = {elapsed:.0f}s', flush=True)
+        print(f'  └{"─"*50}', flush=True)
 
         logger.info(
             f"Epoch {epoch:3d}/{args.epochs} | "
@@ -295,7 +345,6 @@ def main():
         )
         csv_log.log(epoch, train_loss, map50, map5095, lr_now, elapsed)
 
-        # Sauvegarde meilleur modèle
         if map50 > best_map50:
             best_map50 = map50
             torch.save({
@@ -306,9 +355,13 @@ def main():
                 'mAP50_95':   map5095,
                 'n_params':   n_params,
             }, ckpt_path)
-            logger.info(f"  ✓ Nouveau meilleur mAP@50 = {map50:.4f} "
-                        f"→ sauvegardé dans {ckpt_path}")
+            print(f'  ★ Nouveau meilleur mAP@50 = {map50:.4f} '
+                  f'→ sauvegardé dans {ckpt_path}', flush=True)
+            logger.info(f"  ✓ Nouveau meilleur mAP@50 = {map50:.4f}")
 
+    print(f'\n{"="*65}', flush=True)
+    print(f'  Entraînement terminé. Meilleur mAP@50 = {best_map50:.4f}', flush=True)
+    print(f'{"="*65}', flush=True)
     logger.info(f"\nEntraînement terminé. Meilleur mAP@50 = {best_map50:.4f}")
 
 
