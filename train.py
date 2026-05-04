@@ -121,17 +121,18 @@ class DetectionLoss(torch.nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 # Boucle d'entraînement
 # ─────────────────────────────────────────────────────────────────────────────
-def train_one_epoch(model, loader, optimizer, criterion, device, img_size):
+def train_one_epoch(model, loader, optimizer, criterion, device,
+                    img_size, csv_log=None, epoch=0):
     import time
     model.train()
     total_loss = 0.0
     running_loss = 0.0
+    lr = optimizer.param_groups[0]['lr']
 
     try:
         from tqdm import tqdm
         pbar = tqdm(loader, desc='  [TRAIN]', ncols=100,
-                    leave=True,          # ← reste affiché après 100%
-                    dynamic_ncols=False)
+                    leave=True, dynamic_ncols=False)
         iterable = pbar
     except ImportError:
         iterable = loader
@@ -154,6 +155,14 @@ def train_one_epoch(model, loader, optimizer, criterion, device, img_size):
         total_loss   += loss.item()
         running_loss  = total_loss / (i + 1)
 
+        # ── Écriture CSV batch en temps réel ────────────────────────────
+        if csv_log is not None:
+            csv_log.log_batch(
+                epoch=epoch, batch=i + 1,
+                batch_loss=loss.item(), avg_loss=running_loss,
+                lr=lr, time_s=elapsed
+            )
+
         if pbar is not None:
             pbar.set_postfix(
                 loss=f'{loss.item():.4f}',
@@ -166,7 +175,6 @@ def train_one_epoch(model, loader, optimizer, criterion, device, img_size):
                   f'loss={loss.item():.4f} | avg={running_loss:.4f} | '
                   f'{elapsed:.1f}s/batch', flush=True)
 
-    # Ligne de résumé visible après la barre
     if pbar is not None:
         pbar.set_description('  [TRAIN] done')
         pbar.close()
@@ -271,7 +279,7 @@ def main():
     ckpt_path = run_dir / 'best.pt'
 
     logger    = setup_logger(args.conv, str(run_dir), args.conv)
-    csv_log   = CSVLogger(str(run_dir / 'metrics.csv'))
+    csv_log   = CSVLogger(str(run_dir))   # ← dossier, pas fichier
 
     logger.info(f"Convolution : {args.conv.upper()}")
     logger.info(f"Device      : {device}")
@@ -302,48 +310,69 @@ def main():
     best_map50 = 0.0
 
     for epoch in range(1, args.epochs + 1):
-        t0 = time.time()
+        import time as _time
+        t_epoch_start = _time.time()
 
-        # Séparateur d'epoch visible
         sep = '─' * 65
         print(f'\n{sep}', flush=True)
         print(f'  Epoch {epoch}/{args.epochs}  |  conv={args.conv.upper()}  '
               f'|  lr={optimizer.param_groups[0]["lr"]:.2e}', flush=True)
         print(sep, flush=True)
 
+        # ── TRAIN ────────────────────────────────────────────────────────────
+        t_train_start = _time.time()
         train_loss = train_one_epoch(
-            model, train_dl, optimizer, criterion, device, args.img_size
+            model, train_dl, optimizer, criterion, device, args.img_size,
+            csv_log=csv_log, epoch=epoch       # ← passe le logger
         )
+        train_time = _time.time() - t_train_start
 
+        # Écrit immédiatement la ligne epoch avec PENDING pour val
+        lr_now = optimizer.param_groups[0]['lr']
+        csv_log.log_train_done(
+            epoch=epoch, train_loss=train_loss,
+            lr=lr_now, train_time_s=train_time
+        )
+        print(f'  ✓ Train terminé ({train_time:.0f}s) — '
+              f'metrics.csv mis à jour (val PENDING)', flush=True)
+
+        # ── VALIDATION ───────────────────────────────────────────────────────
         print(f'\n  Validation...', flush=True)
+        t_val_start = _time.time()
         val_results = validate(
             model, val_dl, metric, device, args.img_size
         )
-        scheduler.step()
+        val_time = _time.time() - t_val_start
 
-        elapsed = time.time() - t0
-        lr_now  = scheduler.get_last_lr()[0]
+        scheduler.step()
+        lr_now = scheduler.get_last_lr()[0]
         map50   = val_results['mAP50']
         map5095 = val_results['mAP50_95']
 
-        # Résumé de l'epoch
+        # Remplace PENDING par les vraies valeurs
+        csv_log.log_epoch(
+            epoch=epoch, train_loss=train_loss,
+            val_map50=map50, val_map50_95=map5095,
+            lr=lr_now, train_time_s=train_time, val_time_s=val_time
+        )
+
+        total_time = _time.time() - t_epoch_start
+
+        # Résumé console
         print(f'\n  ┌─ EPOCH {epoch:3d}/{args.epochs} RÉSUMÉ {"─"*38}', flush=True)
-        print(f'  │  loss        = {train_loss:.4f}', flush=True)
+        print(f'  │  train loss  = {train_loss:.4f}', flush=True)
         print(f'  │  mAP@50      = {map50:.4f}', flush=True)
         print(f'  │  mAP@50:95   = {map5095:.4f}', flush=True)
         print(f'  │  lr          = {lr_now:.2e}', flush=True)
-        print(f'  │  temps total = {elapsed:.0f}s', flush=True)
+        print(f'  │  train       = {train_time:.0f}s  |  val = {val_time:.0f}s  '
+              f'|  total = {total_time:.0f}s', flush=True)
         print(f'  └{"─"*50}', flush=True)
 
         logger.info(
-            f"Epoch {epoch:3d}/{args.epochs} | "
-            f"loss={train_loss:.4f} | "
-            f"mAP@50={map50:.4f} | "
-            f"mAP@50:95={map5095:.4f} | "
-            f"lr={lr_now:.2e} | "
-            f"{elapsed:.0f}s"
+            f"Epoch {epoch:3d}/{args.epochs} | loss={train_loss:.4f} | "
+            f"mAP@50={map50:.4f} | mAP@50:95={map5095:.4f} | "
+            f"lr={lr_now:.2e} | {total_time:.0f}s"
         )
-        csv_log.log(epoch, train_loss, map50, map5095, lr_now, elapsed)
 
         if map50 > best_map50:
             best_map50 = map50
@@ -356,13 +385,13 @@ def main():
                 'n_params':   n_params,
             }, ckpt_path)
             print(f'  ★ Nouveau meilleur mAP@50 = {map50:.4f} '
-                  f'→ sauvegardé dans {ckpt_path}', flush=True)
+                  f'→ {ckpt_path}', flush=True)
             logger.info(f"  ✓ Nouveau meilleur mAP@50 = {map50:.4f}")
 
     print(f'\n{"="*65}', flush=True)
     print(f'  Entraînement terminé. Meilleur mAP@50 = {best_map50:.4f}', flush=True)
     print(f'{"="*65}', flush=True)
-    logger.info(f"\nEntraînement terminé. Meilleur mAP@50 = {best_map50:.4f}")
+    logger.info(f"Entraînement terminé. Meilleur mAP@50 = {best_map50:.4f}")
 
 
 if __name__ == '__main__':
