@@ -10,7 +10,7 @@
 #   import subprocess
 #   subprocess.run(['bash', 'run_all.sh', '/path/to/visdrone'])
 
-DATA=${1:-"/Users/osias/Documents/PHD/sac_experiment/data/VisDrone"}
+DATA=${1:-"/content/visdrone"}
 EPOCHS=${2:-50}
 BATCH=${3:-8}
 IMG_SIZE=${4:-640}

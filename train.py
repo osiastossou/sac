@@ -122,9 +122,20 @@ class DetectionLoss(torch.nn.Module):
 # Boucle d'entraînement
 # ─────────────────────────────────────────────────────────────────────────────
 def train_one_epoch(model, loader, optimizer, criterion, device, img_size):
+    import time
     model.train()
     total_loss = 0.0
-    for batch in loader:
+
+    try:
+        from tqdm import tqdm
+        pbar = tqdm(loader, desc='  train', ncols=90, leave=False)
+        iterable = pbar
+    except ImportError:
+        iterable = loader
+        pbar = None
+
+    for i, batch in enumerate(iterable):
+        t0 = time.time()
         imgs   = batch['image'].to(device)
         boxes  = batch['boxes'].to(device)
         mask   = batch['mask'].to(device)
@@ -135,8 +146,19 @@ def train_one_epoch(model, loader, optimizer, criterion, device, img_size):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
         optimizer.step()
+
+        elapsed = time.time() - t0
         total_loss += loss.item()
 
+        if pbar is not None:
+            pbar.set_postfix(loss=f'{loss.item():.4f}', t=f'{elapsed:.1f}s')
+        else:
+            print(f'    batch {i+1}/{len(loader)} | '
+                  f'loss={loss.item():.4f} | {elapsed:.1f}s/batch',
+                  flush=True)
+
+    if pbar is not None:
+        pbar.close()
     return total_loss / len(loader)
 
 
@@ -209,7 +231,7 @@ def main():
     if args.device:
         device = torch.device(args.device)
     else:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # ── Dossiers de sortie ───────────────────────────────────────────────────
     run_dir = Path(args.out_dir) / args.conv

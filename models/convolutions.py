@@ -395,104 +395,113 @@ class HyperConv(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 class SAC(nn.Module):
     """
-    Pour chaque position (i,j), calcule le vecteur de statistiques du patch :
-        S_ij = [μ, σ, γ (skewness), κ (kurtosis), H (entropie)] ∈ R^5
+    Convolution Statistiquement Adaptative — version vectorisée GPU.
 
-    Un MLP partagé g_θ : R^5 → R^(C·k²) génère le noyau adaptatif W_ij.
-    La convolution est alors :
-        y_ij = <W_ij, P_ij>
+    Pour chaque position (i,j) :
+        S_ij = [μ, σ, γ (skewness), κ (kurtosis), H (entropie)] ∈ R^5
+        W_ij = g_θ(S_ij)          ← MLP partagé
+        y_ij = <W_ij, P_ij>       ← produit scalaire
+
+    Toutes les opérations sont vectorisées sur la dimension L = H'×W'
+    avec des opérations tensorielles PyTorch pures — pas de boucles Python.
 
     Notre proposition — voir le rapport technique SAC (2026).
     """
 
     def __init__(self, in_channels, out_channels, kernel_size=3,
-                 stride=1, padding=1, h_dim=64, n_bins=16, **kwargs):
+                 stride=1, padding=1, h_dim=32, n_bins=8, **kwargs):
         super().__init__()
-        self.in_ch = in_channels
+        self.in_ch  = in_channels
         self.out_ch = out_channels
-        self.k = kernel_size
+        self.k      = kernel_size
         self.stride = stride
         self.padding = padding
-        self.n_bins = n_bins
+        self.n_bins  = n_bins
 
-        # d = 5 descripteurs statistiques
-        d = 5
+        d           = 5
         kernel_flat = in_channels * kernel_size * kernel_size
 
-        # MLP générateur partagé g_θ : R^d → R^(out * in * k²)
+        # MLP générateur partagé g_θ
         self.generator = nn.Sequential(
             nn.Linear(d, h_dim),
             nn.ReLU(inplace=True),
             nn.Linear(h_dim, out_channels * kernel_flat)
         )
-        self.bn = nn.BatchNorm2d(out_channels)
+        self.bn  = nn.BatchNorm2d(out_channels)
         self.act = nn.ReLU(inplace=True)
 
-    # ── Calcul des statistiques ───────────────────────────────────────────────
+    # ── Statistiques 100 % vectorisées ───────────────────────────────────────
     @staticmethod
     @torch.no_grad()
     def _patch_stats(patches: torch.Tensor, n_bins: int) -> torch.Tensor:
         """
-        patches : (B, C*k*k, L)  —  L = nombre de positions spatiales
+        Calcule [μ, σ, γ, κ, H] pour chaque patch en une seule passe
+        vectorisée sur GPU.
 
-        Retourne stats : (L_total, 5) avec L_total = B * L
-        Les statistiques sont calculées sur la dimension C*k*k (les N=C·k² éléments
-        du patch).  stop-gradient : @torch.no_grad().
+        patches : (BL, N)  avec N = C·k²
+        retourne : (BL, 5)
         """
-        B, N, L = patches.shape
-        p = patches.permute(0, 2, 1).reshape(B * L, N).float()  # (B*L, N)
+        BL, N = patches.shape
+        p = patches.float()
 
-        mu = p.mean(dim=1)                             # (B*L,)
-        diff = p - mu.unsqueeze(1)                     # (B*L, N)
-        sigma = diff.pow(2).mean(dim=1).sqrt() + 1e-8  # (B*L,)
+        # ── Moments ────────────────────────────────────────────────────────
+        mu    = p.mean(dim=1)                        # (BL,)
+        diff  = p - mu.unsqueeze(1)                  # (BL, N)
+        var   = diff.pow(2).mean(dim=1)              # (BL,)
+        sigma = var.sqrt() + 1e-8                    # (BL,)
+        z     = diff / sigma.unsqueeze(1)            # (BL, N) standardisé
+        skew  = z.pow(3).mean(dim=1)                 # (BL,)
+        kurt  = z.pow(4).mean(dim=1) - 3.0           # (BL,)
 
-        z = diff / sigma.unsqueeze(1)                  # (B*L, N)  — standardisé
-        skew = z.pow(3).mean(dim=1)                    # (B*L,)
-        kurt = z.pow(4).mean(dim=1) - 3.0              # (B*L,)  — excès
+        # ── Entropie via scatter_add (sans one_hot géant) ───────────────────
+        p_min  = p.min(dim=1, keepdim=True).values   # (BL, 1)
+        p_max  = p.max(dim=1, keepdim=True).values   # (BL, 1)
+        p_norm = (p - p_min) / (p_max - p_min + 1e-8)
+        bin_idx = (p_norm * (n_bins - 1)).long().clamp(0, n_bins - 1)  # (BL, N)
 
-        # Entropie locale : histogramme discret sur N valeurs
-        p_min = p.min(dim=1, keepdim=True).values
-        p_max = p.max(dim=1, keepdim=True).values
-        p_norm = (p - p_min) / (p_max - p_min + 1e-8)  # (B*L, N) in [0,1]
-        bin_idx = (p_norm * (n_bins - 1)).long().clamp(0, n_bins - 1)
-        H = torch.zeros(B * L, device=p.device)
-        for b in range(n_bins):
-            prob = (bin_idx == b).float().mean(dim=1) + 1e-8
-            H -= prob * prob.log()
+        # counts : (BL, n_bins) — nombre d'éléments par bin
+        counts = torch.zeros(BL, n_bins, device=p.device, dtype=torch.float32)
+        counts.scatter_add_(1, bin_idx,
+                            torch.ones(BL, N, device=p.device))
+        probs = counts / N + 1e-8                    # (BL, n_bins)
+        H     = -(probs * probs.log()).sum(dim=1)    # (BL,)
 
-        stats = torch.stack([mu, sigma, skew, kurt, H], dim=1)  # (B*L, 5)
-        return stats
+        return torch.stack([mu, sigma, skew, kurt, H], dim=1)  # (BL, 5)
 
     # ── Forward ───────────────────────────────────────────────────────────────
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
-        k, s, p_pad = self.k, self.stride, self.padding
+        k, s, pad  = self.k, self.stride, self.padding
 
-        H_out = (H + 2 * p_pad - k) // s + 1
-        W_out = (W + 2 * p_pad - k) // s + 1
-        L = H_out * W_out
+        H_out = (H + 2 * pad - k) // s + 1
+        W_out = (W + 2 * pad - k) // s + 1
+        L     = H_out * W_out
+        N     = self.in_ch * k * k
 
-        # Extrait tous les patches : (B, C*k*k, L)
-        patches = F.unfold(x, kernel_size=k, stride=s, padding=p_pad)
+        # ── Extraction de tous les patches ────────────────────────────────
+        patches = F.unfold(x, kernel_size=k, stride=s, padding=pad)  # (B, N, L)
 
-        # Calcule les statistiques (stop-gradient)
-        stats = self._patch_stats(patches, self.n_bins)    # (B*L, 5)
-        stats = stats.to(x.dtype)
+        # ── Statistiques (stop-gradient, vectorisé) ───────────────────────
+        p_flat = patches.permute(0, 2, 1).reshape(B * L, N)   # (BL, N)
+        stats  = self._patch_stats(p_flat, self.n_bins)        # (BL, 5)
+        stats  = stats.to(x.dtype)
 
-        # Génère les noyaux adaptatifs via le MLP partagé
-        kernels = self.generator(stats)                    # (B*L, out*C*k²)
-        kernels = kernels.view(B, L, self.out_ch,
-                               self.in_ch * k * k)         # (B, L, out, C*k²)
+        # ── Génération des noyaux adaptatifs ─────────────────────────────
+        # kernels : (BL, out_ch * N)
+        kernels = self.generator(stats)
 
-        # Convolution adaptative position par position :
-        # patches : (B, C*k*k, L) → (B, L, C*k*k, 1)
-        p_t = patches.permute(0, 2, 1).unsqueeze(-1)      # (B, L, C*k², 1)
+        # ── Convolution via einsum (évite la matmul géante) ───────────────
+        # patches : (B, N, L) → on veut sortie (B, out_ch, L)
+        # kernels : (BL, out_ch * N) → (B, L, out_ch, N)
+        kernels = kernels.view(B, L, self.out_ch, N)
 
-        # Produit scalaire : (B, L, out, C*k²) @ (B, L, C*k², 1) → (B, L, out, 1)
-        out_flat = torch.matmul(kernels, p_t).squeeze(-1)  # (B, L, out)
-        out_flat = out_flat.permute(0, 2, 1)               # (B, out, L)
-        out = out_flat.view(B, self.out_ch, H_out, W_out)  # (B, out, H', W')
+        # (B, L, out_ch, N) · patches(B, N, L) → (B, L, out_ch)
+        # en einsum : 'blmn, bnl -> blm'
+        patches_t = patches.permute(0, 2, 1)                   # (B, L, N)
+        # broadcast : (B, L, out_ch, N) * (B, L, 1, N)  → sum over N
+        out_flat = (kernels * patches_t.unsqueeze(2)).sum(dim=-1)  # (B, L, out_ch)
 
+        out = out_flat.permute(0, 2, 1).reshape(B, self.out_ch, H_out, W_out)
         return self.act(self.bn(out))
 
 
