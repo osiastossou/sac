@@ -773,8 +773,8 @@ CONV_REGISTRY = {
     "pac":            PAC,
     "knconv":         KNConv,
     "hyperconv":      HyperConv,
-    "sac":            SAC,
-    "sac_fast":       SAC_Fast,
+    #"sac":            SAC,
+    #"sac_fast":       SAC_Fast,
     "pwc":            PWC,
 }
 
