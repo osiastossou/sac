@@ -1,0 +1,140 @@
+# VisDrone2019-DET Dataset Configuration
+# Usage : python train.py --data datasets/visdrone.yaml
+#
+# Le dataset sera telecharge automatiquement si le dossier 'path' n'existe pas.
+# Taille : ~2.3 GB
+# Source : https://github.com/VisDrone/VisDrone-Dataset
+
+path: VisDrone       # dossier racine (cree automatiquement si absent)
+train: images/train  # 6471 images
+val:   images/val    # 548 images
+test:  images/test   # 1610 images (optionnel)
+
+# Classes (10 classes, index 0-based)
+nc: 10
+names:
+  0: pedestrian
+  1: people
+  2: bicycle
+  3: car
+  4: van
+  5: truck
+  6: tricycle
+  7: awning-tricycle
+  8: bus
+  9: motor
+
+# Script de telechargement automatique (execute si 'path' n'existe pas)
+download: |
+  import os
+  import shutil
+  import zipfile
+  import urllib.request
+  from pathlib import Path
+
+  def download_file(url, dest):
+      """Telecharge un fichier avec barre de progression."""
+      import sys
+      dest = Path(dest)
+      dest.parent.mkdir(parents=True, exist_ok=True)
+      print(f"  Downloading {dest.name} ...", flush=True)
+      try:
+          urllib.request.urlretrieve(url, dest)
+          print(f"  Done: {dest.name} ({dest.stat().st_size // 1024 // 1024} MB)",
+                flush=True)
+      except Exception as e:
+          print(f"  Failed: {e}", flush=True)
+          raise
+
+  def visdrone2yolo(dir, split, source_folder):
+      """Convert VisDrone annotations to YOLO format."""
+      try:
+          from PIL import Image
+      except ImportError:
+          import subprocess
+          subprocess.run(['pip', 'install', 'Pillow', '-q'])
+          from PIL import Image
+
+      source_dir   = Path(dir) / source_folder
+      images_dir   = Path(dir) / 'images' / split
+      labels_dir   = Path(dir) / 'labels' / split
+      images_dir.mkdir(parents=True, exist_ok=True)
+      labels_dir.mkdir(parents=True, exist_ok=True)
+
+      # Move images
+      src_imgs = source_dir / 'images'
+      if src_imgs.exists():
+          for img in src_imgs.glob('*.jpg'):
+              shutil.move(str(img), str(images_dir / img.name))
+
+      # Convert annotations
+      ann_dir = source_dir / 'annotations'
+      if not ann_dir.exists():
+          print(f"  No annotations found in {ann_dir}", flush=True)
+          return
+
+      ann_files = list(ann_dir.glob('*.txt'))
+      print(f"  Converting {len(ann_files)} annotations for {split}...",
+            flush=True)
+
+      for f in ann_files:
+          img_path = images_dir / f.with_suffix('.jpg').name
+          if not img_path.exists():
+              continue
+          img_size = Image.open(img_path).size
+          dw, dh = 1.0 / img_size[0], 1.0 / img_size[1]
+          lines = []
+          with open(f, encoding='utf-8') as file:
+              for row in [x.split(',') for x in file.read().strip().splitlines()]:
+                  if len(row) < 6 or row[4] == '0':
+                      continue   # ignore ignored regions
+                  x, y, w, h = map(int, row[:4])
+                  cls = int(row[5]) - 1   # 1-indexed -> 0-indexed
+                  if cls < 0 or cls > 9:
+                      continue
+                  xc = (x + w / 2) * dw
+                  yc = (y + h / 2) * dh
+                  wn = w * dw
+                  hn = h * dh
+                  lines.append(f'{cls} {xc:.6f} {yc:.6f} {wn:.6f} {hn:.6f}\n')
+          (labels_dir / f.name).write_text(''.join(lines), encoding='utf-8')
+
+  # --- Main download ---
+  dir = Path(yaml['path'])
+  dir.mkdir(parents=True, exist_ok=True)
+
+  base_url = 'https://github.com/ultralytics/assets/releases/download/v0.0.0'
+  files = {
+      'VisDrone2019-DET-train.zip': 'train',
+      'VisDrone2019-DET-val.zip':   'val',
+      'VisDrone2019-DET-test-dev.zip': 'test',
+  }
+
+  for fname, split in files.items():
+      zip_path = dir / fname
+      folder   = fname.replace('.zip', '')
+
+      # Skip if already converted
+      if (dir / 'images' / split).exists():
+          print(f"  [{split}] Already converted, skipping.", flush=True)
+          continue
+
+      # Download
+      url = f'{base_url}/{fname}'
+      download_file(url, zip_path)
+
+      # Extract
+      print(f"  Extracting {fname}...", flush=True)
+      with zipfile.ZipFile(zip_path, 'r') as z:
+          z.extractall(dir)
+      zip_path.unlink()   # delete zip after extraction
+
+      # Convert to YOLO format
+      visdrone2yolo(dir, split, folder)
+
+      # Cleanup original folder
+      src_dir = dir / folder
+      if src_dir.exists():
+          shutil.rmtree(src_dir)
+
+  print(f"\n  VisDrone dataset ready in: {dir}", flush=True)

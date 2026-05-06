@@ -1,0 +1,21 @@
+# Dataset Synthétique — Configuration
+# Généré par : python generate_synthetic.py --out_dir ./synthetic_dataset
+# Usage      : python train.py --data datasets/synthetic.yaml
+
+path: synthetic_dataset  # Dossier racine (relatif au dossier sac_experiment/)
+train: images/train      # Images train
+val:   images/val        # Images val
+
+# Classes (mêmes que VisDrone pour compatibilité)
+nc: 10
+names:
+  0: pedestrian
+  1: people
+  2: bicycle
+  3: car
+  4: van
+  5: truck
+  6: tricycle
+  7: awning-tricycle
+  8: bus
+  9: motor

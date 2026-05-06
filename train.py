@@ -271,7 +271,7 @@ def main():
     if args.device:
         device = torch.device(args.device)
     else:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # ── Dossiers de sortie ───────────────────────────────────────────────────
     run_dir = Path(args.out_dir) / args.conv

@@ -18,3 +18,4 @@ __pycache__/
 *.ipynb_checkpoints/
 
 */__pycache__/
+synthetic_small/
