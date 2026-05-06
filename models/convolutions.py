@@ -762,20 +762,134 @@ class PWC(nn.Module):
         return self.act(self.bn(out))
 
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision.ops import deform_conv2d
+
+class DPWC(nn.Module):
+    """
+    Deformable Probability-Weighted Convolution (DPWC).
+    
+    Cette classe combine :
+    1. Deformable Convolution : Adaptation géométrique via des offsets appris.
+    2. PWC : Amplification statistique des pixels rares (inverse-probabilité).
+    
+    Logique :
+    - Une branche apprend les offsets (x, y) pour chaque point du noyau.
+    - On extrait les caractéristiques déformées.
+    - On calcule les poids PWC sur ces caractéristiques déformées.
+    - On applique la convolution avec les poids du filtre appris.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size=3, 
+                 stride=1, padding=1, n_bins=17, eps=1e-6, **kwargs):
+        super().__init__()
+        self.in_ch = in_channels
+        self.out_ch = out_channels
+        self.k = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.n_bins = n_bins
+        self.eps = eps
+
+        # 1. Branche pour les Offsets (Deformable)
+        # Sortie : 2 * kernel_size * kernel_size (coordonnées x et y)
+        self.offset_conv = nn.Conv2d(in_channels, 2 * kernel_size**2, 
+                                     kernel_size=kernel_size, 
+                                     stride=stride, padding=padding)
+        
+        # 2. Paramètres de la Convolution (Filtre W)
+        self.weight = nn.Parameter(
+            torch.empty(out_channels, in_channels, kernel_size, kernel_size)
+        )
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
+        # Normalisation et Activation
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.act = nn.ReLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        
+        # --- ÉTAPE 1 : CALCUL DES OFFSETS ---
+        offsets = self.offset_conv(x)
+
+        # --- ÉTAPE 2 : EXTRACTION DES PATCHS DÉFORMÉS ---
+        # Pour PWC, nous avons besoin des valeurs des pixels échantillonnés.
+        # On utilise unfold pour obtenir la structure de patch, mais attention :
+        # PWC doit s'appliquer sur les pixels "vus" par la convolution déformable.
+        # Approche : On utilise une astuce avec deform_conv2d et un filtre identité 
+        # pour récupérer les patchs échantillonnés.
+        
+        # Création d'un filtre identité pour extraire les pixels échantillonnés
+        # (Équivalent à un 'deformable unfold')
+        with torch.no_grad():
+            # [B, C*k*k, H_out, W_out]
+            sampled_pixels = self._get_deformable_patches(x, offsets)
+
+        # --- ÉTAPE 3 : CALCUL DES POIDS PWC (sur les pixels déplacés) ---
+        # sampled_pixels shape: (B, C*k*k, L)
+        L = sampled_pixels.shape[-1]
+        N = self.in_ch * self.k * self.k
+        
+        # Utilisation de votre logique _probability_weights
+        # On traite les poids en stop-gradient
+        weights = PWC._probability_weights(
+            sampled_pixels, self.n_bins, self.eps
+        ).to(x.dtype)
+
+        # --- ÉTAPE 4 : CONVOLUTION DÉFORMABLE PONDÉRÉE ---
+        # On multiplie l'entrée originale par les poids ? Non, on applique les poids 
+        # sur les pixels déjà échantillonnés (sampled_pixels) pour le calcul final.
+        
+        # Patchs pondérés : (B, N, L)
+        sampled_weighted = sampled_pixels * weights
+        
+        # Reconstruction du résultat (Matmul efficace)
+        # W_flat: (out_ch, N) @ sampled_weighted: (B, N, L) -> (B, out_ch, L)
+        W_flat = self.weight.view(self.out_ch, -1)
+        out_flat = torch.matmul(W_flat, sampled_weighted)
+        
+        # Reshape vers la sortie finale
+        H_out = (H + 2*self.padding - self.k) // self.stride + 1
+        W_out = (W + 2*self.padding - self.k) // self.stride + 1
+        out = out_flat.view(B, self.out_ch, H_out, W_out)
+
+        return self.act(self.bn(out))
+
+    def _get_deformable_patches(self, x, offsets):
+        """
+        Extrait les pixels échantillonnés par la convolution déformable.
+        Utilise une convolution déformable avec un noyau 'one-hot' pour agir comme un unfold.
+        """
+        B, C, H, W = x.shape
+        kh, kw = self.k, self.k
+        # On simule un unfold déformable en utilisant des groupes pour préserver les canaux
+        # Cette partie est cruciale pour que PWC voit les mêmes pixels que le filtre W.
+        device = x.device
+        
+        # Filtre "identité" pour l'unfold déformable
+        # Chaque poids est 1 pour un canal et une position spatiale spécifique du noyau
+        identity_weight = torch.eye(C * kh * kw, device=device).view(C * kh * kw, C, kh, kw)
+        
+        return deform_conv2d(x, offsets, identity_weight, 
+                             stride=self.stride, padding=self.padding).flatten(2)
+
 # REGISTRE
 # ─────────────────────────────────────────────────────────────────────────────
 CONV_REGISTRY = {
     "standard":       StandardConv,
     "deformable":     DeformableConv,
-    "dynamic_filter": DynamicFilterConv,
-    "dynamic_conv":   DynamicConv,
-    "condconv":       CondConv,
-    "pac":            PAC,
-    "knconv":         KNConv,
-    "hyperconv":      HyperConv,
+    # "dynamic_filter": DynamicFilterConv,
+    # "dynamic_conv":   DynamicConv,
+    # "condconv":       CondConv,
+    # "pac":            PAC,
+    # "knconv":         KNConv,
+    # "hyperconv":      HyperConv,
     #"sac":            SAC,
     #"sac_fast":       SAC_Fast,
     "pwc":            PWC,
+    "dpwc":           DPWC,
 }
 
 

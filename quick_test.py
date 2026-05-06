@@ -341,6 +341,7 @@ def main():
         'sac':            'SAC',
         'sac_fast':       'SAC Fast',
         'pwc':            'PWC (ours)',
+        'dpwc':           'DPWC (ours)',
     }
 
     # Trie par mAP@50 décroissant (métrique principale)
@@ -362,7 +363,7 @@ def main():
 
     for rank, r in enumerate(results, 1):
         label   = LABELS.get(r['conv'], r['conv'])
-        star    = ' ★' if r['conv'] in ('pwc', 'sac') else ''
+        star    = ' ★' if r['conv'] in ('pwc', 'sac', 'dpwc') else ''
         is_best = valid and r['conv'] == valid[0]['conv']
         mark    = '→ ' if is_best else '  '
 
